@@ -1,4 +1,4 @@
-from backup.trailer_data_parsing import SamsungSEFEditor
+from trailer_data_parser.backup.trailer_data_parsing import SamsungSEFEditor
 
 if __name__ == '__main__':
     # --- EXAMPLE USAGE ---

@@ -32,7 +32,6 @@ class SamsungSEFEditorPreservation:
         0xd31: "Food_Blur_Effect_Info", 0xd91: "PEg_Info", 0xda1: "Captured_App_Info"
     }
 
-    # Fallback for NEW manual entries only
     DEFAULT_EMBEDDED_IDS = [0x001, 0xb41, 0xc81, 0xd11, 0xd31, 0xa01, 0xba1, 0x910, 0xc61]
 
     def __init__(self, filepath):
@@ -95,13 +94,13 @@ class SamsungSEFEditorPreservation:
             if data_start_abs < 0: continue
 
             raw_entries.append({
-                'id': tid,
+                'entry_id': tid,
                 'start': data_start_abs,
                 'end': data_end_abs,
                 'length': length
             })
 
-        # 3. Sort by Position (Critical for gap finding)
+        # 3. Sort by Position
         raw_entries.sort(key=lambda x: x['start'])
 
         # 4. Harvest Data & Padding
@@ -115,20 +114,20 @@ class SamsungSEFEditorPreservation:
             else:
                 next_start = dir_start
 
-            # Safety: Ensure we don't read negative padding if blocks overlap
             if next_start < entry['end']:
                 padding_bytes = b''
             else:
                 padding_bytes = data[entry['end']: next_start]
 
-            # Analysis
-            name, clean_val, encap_style = self._analyze_payload(entry['id'], raw_payload)
+            # Analysis (Now returns head_padding too)
+            name, clean_val, encap_style, head_pad = self._analyze_payload(entry['entry_id'], raw_payload)
 
             self.entries.append({
-                'id': entry['id'],
+                'entry_id': entry['entry_id'],
                 'name': name,
                 'value': clean_val,
-                'padding': padding_bytes,
+                'padding': padding_bytes,  # Tail Padding (Gap)
+                'head_padding': head_pad,  # Head Padding (Garbage before name)
                 'encap_type': encap_style,
                 'is_dirty': False
             })
@@ -143,21 +142,31 @@ class SamsungSEFEditorPreservation:
         logger.success(f"Loaded {len(self.entries)} entries (Preservation Mode).")
 
     def _analyze_payload(self, tid, payload):
+        """
+        Returns: Name, Value, EncapStyle, HeadPadding
+        """
         expected_name = self.SEF_TAG_MAP.get(tid, f"Tag_{hex(tid)}")
+        head_padding = b''
 
-        # 1. Check Key Match (Anchored to START of string)
+        # 1. Search for Name (Allow it to be offset by garbage)
         try:
             head_str = payload[:100].decode('latin-1')
             if expected_name in head_str:
-                # FIX: Must match at START (^) to avoid false positives in binary data
-                match = re.search(r'^' + re.escape(expected_name), head_str)
+                # Remove ^ anchor to find name even if there is junk before it
+                match = re.search(re.escape(expected_name), head_str)
                 if match:
                     val_start = match.end()
+                    name_start = match.start()
 
+                    # Capture Head Padding (Garbage before name)
+                    if name_start > 0:
+                        head_padding = payload[:name_start]
+
+                    # Determine Style
                     if val_start < len(payload) and payload[val_start] == 0:
-                        return expected_name, payload[val_start + 1:], self.ENCAP_NULL
+                        return expected_name, payload[val_start + 1:], self.ENCAP_NULL, head_padding
                     else:
-                        return expected_name, payload[val_start:], self.ENCAP_DIRECT
+                        return expected_name, payload[val_start:], self.ENCAP_DIRECT, head_padding
         except:
             pass
 
@@ -167,22 +176,20 @@ class SamsungSEFEditorPreservation:
                 parts = payload.split(b'\x00', 1)
                 name_cand = parts[0].decode('utf-8')
                 if re.match(r'^[A-Za-z0-9_]+$', name_cand):
-                    return name_cand, parts[1], self.ENCAP_NULL
+                    return name_cand, parts[1], self.ENCAP_NULL, b''
         except:
             pass
 
         # 3. Raw Fallback
-        return expected_name, payload, self.ENCAP_RAW
+        return expected_name, payload, self.ENCAP_RAW, b''
 
     # --- CRUD ---
 
     def add_or_update_entry(self, key_id, value, name=None):
         final_id = self._resolve_id(key_id)
-        if final_id == 0:
-            logger.error(f"Invalid Key: {key_id}")
-            return
+        if final_id == 0: return
 
-        # Value Conversion
+        # Convert
         binary_payload = b''
         if isinstance(value, int):
             try:
@@ -199,30 +206,25 @@ class SamsungSEFEditorPreservation:
         if not name:
             name = self.SEF_TAG_MAP.get(final_id, f"Tag_{hex(final_id)}")
 
-        # Check existing
+        # Update
         for entry in self.entries:
-            if entry['id'] == final_id:
+            if entry['entry_id'] == final_id:
                 entry['value'] = binary_payload
                 entry['name'] = name
                 entry['is_dirty'] = True
 
-                # --- FIX: ENFORCE ENCAPSULATION FOR KNOWN IDS ---
-                # If we are modifying a known Embedded Key (like 0xa01),
-                # and it was previously mis-detected as RAW, we MUST fix it.
+                # Upgrade mis-detected Raw types
                 if final_id in self.DEFAULT_EMBEDDED_IDS:
                     if entry['encap_type'] == self.ENCAP_RAW:
-                        # Upgrade to correct type
                         if final_id in [0xa01, 0xc61]:
                             entry['encap_type'] = self.ENCAP_DIRECT
-                            logger.info(f"Fixed encapsulation for {hex(final_id)} to DIRECT")
                         else:
                             entry['encap_type'] = self.ENCAP_NULL
-                            logger.info(f"Fixed encapsulation for {hex(final_id)} to NULL")
 
                 logger.info(f"Updated {hex(final_id)}")
                 return
 
-        # Add New (Default Policies)
+        # Add New
         def_encap = self.ENCAP_RAW
         if final_id in self.DEFAULT_EMBEDDED_IDS:
             if final_id in [0xa01, 0xc61]:
@@ -231,8 +233,8 @@ class SamsungSEFEditorPreservation:
                 def_encap = self.ENCAP_NULL
 
         self.entries.append({
-            'id': final_id, 'name': name, 'value': binary_payload,
-            'padding': b'', 'encap_type': def_encap, 'is_dirty': True
+            'entry_id': final_id, 'name': name, 'value': binary_payload,
+            'padding': b'', 'head_padding': b'', 'encap_type': def_encap, 'is_dirty': True
         })
         logger.info(f"Added {hex(final_id)}")
 
@@ -254,10 +256,10 @@ class SamsungSEFEditorPreservation:
     def _validate_integrity(self):
         seen = set()
         for e in self.entries:
-            if e['id'] in seen:
-                logger.critical(f"INTEGRITY FAIL: Duplicate ID {hex(e['id'])}")
+            if e['entry_id'] in seen:
+                logger.critical(f"INTEGRITY FAIL: Duplicate ID {hex(e['entry_id'])}")
                 return False
-            seen.add(e['id'])
+            seen.add(e['entry_id'])
         return True
 
     def save(self, output_path):
@@ -270,23 +272,34 @@ class SamsungSEFEditorPreservation:
             val = e['value']
             name = e['name']
             encap = e['encap_type']
-            is_dirty = e['is_dirty']
+            head_pad = e.get('head_padding', b'')  # Restore head garbage
 
             # Reconstruct Payload
-            final_payload = val
+            # Start with Head Padding (The garbage before the name)
+            final_payload = head_pad
 
+            # Append Encapsulated Data
             if encap == self.ENCAP_DIRECT:
+                # Only add name if val doesn't already have it
                 if not val.startswith(name.encode('utf-8')):
-                    final_payload = name.encode('utf-8') + val
+                    final_payload += name.encode('utf-8') + val
+                else:
+                    final_payload += val
+
             elif encap == self.ENCAP_NULL:
                 name_bytes = name.encode('utf-8') + b'\x00'
                 if not val.startswith(name_bytes):
-                    final_payload = name_bytes + val
+                    final_payload += name_bytes + val
+                else:
+                    final_payload += val
 
-            # Handle Padding
+            elif encap == self.ENCAP_RAW:
+                final_payload += val
+
+            # Handle Tail Padding
             final_padding = b''
-            if not is_dirty:
-                final_padding = e['padding']  # Preservation
+            if not e['is_dirty']:
+                final_padding = e['padding']
             else:
                 # Recalculate strict alignment for dirty items
                 real_len = len(final_payload)
@@ -295,7 +308,7 @@ class SamsungSEFEditorPreservation:
                     final_padding = b'\x00' * (4 - remainder)
 
             packed_blocks.append({
-                'id': e['id'],
+                'entry_id': e['entry_id'],
                 'data': final_payload + final_padding,
                 'table_len': len(final_payload)
             })
@@ -312,7 +325,7 @@ class SamsungSEFEditorPreservation:
         for block in packed_blocks:
             d_len = len(block['data'])
             d_offset = total_phys_len - current_cursor
-            id_val = block['id'] << 16
+            id_val = block['entry_id'] << 16
             entry_bin = struct.pack('<III', id_val, d_offset, block['table_len'])
             table_bytes += entry_bin
             current_cursor += d_len

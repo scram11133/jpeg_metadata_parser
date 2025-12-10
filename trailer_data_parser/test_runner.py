@@ -89,7 +89,7 @@ def test_modification(filepath):
 
         found_val = None
         for e in checker.entries:
-            if e['id'] == 0xa01:
+            if e['entry_id'] == 0xa01:
                 found_val = e['value']
                 break
 
