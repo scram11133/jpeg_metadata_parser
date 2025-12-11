@@ -266,6 +266,21 @@ class SamsungSEFEditor:
         })
         logger.info(f"Added {name} ({hex(final_id)})")  # <--- IMPROVED LOGGING
 
+    def remove_entry(self, key_id):
+        """
+        Removes ALL entries matching the given ID.
+        """
+        final_id = self._resolve_id(key_id)
+        if final_id == 0: return
+
+        initial_count = len(self.entries)
+        # Filter list to keep only entries that DO NOT match the ID
+        self.entries = [e for e in self.entries if e['entry_id'] != final_id]
+
+        removed_count = initial_count - len(self.entries)
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} entries for {hex(final_id)}")
+
     def _resolve_id(self, key):
         if isinstance(key, int): return key
         if isinstance(key, str):
