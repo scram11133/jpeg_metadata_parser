@@ -3,7 +3,7 @@ import shutil
 
 from loguru import logger
 
-from parser import SamsungSEFEditorPreservation
+from parser import SamsungSEFEditor
 
 # --- UPDATE 1: Import the new Preservation Class ---
 
@@ -23,7 +23,7 @@ def setup_directories():
 def test_read_stability(filepath):
     """Test 1: Can we open the file without crashing?"""
     try:
-        editor = SamsungSEFEditorPreservation(filepath)
+        editor = SamsungSEFEditor(filepath)
         count = len(editor.entries)
         has_sef = count > 0
         status = "SEF FOUND" if has_sef else "CLEAN JPEG"
@@ -41,12 +41,12 @@ def test_idempotency(filepath):
 
     try:
         # 1. Load Original
-        editor = SamsungSEFEditorPreservation(filepath)
+        editor = SamsungSEFEditor(filepath)
 
         # Capture state (Now including padding and encap_type)
-        # We strip 'is_dirty' because that resets on reload
+        # We strip 'is_modified' because that resets on reload
         def get_state(ed):
-            return str([{k: v for k, v in e.items() if k != 'is_dirty'} for e in ed.entries])
+            return str([{k: v for k, v in e.items() if k != 'is_modified'} for e in ed.entries])
 
         original_repr = get_state(editor)
 
@@ -54,7 +54,7 @@ def test_idempotency(filepath):
         editor.save(save_path)
 
         # 3. Load the Saved Copy
-        editor_new = SamsungSEFEditorPreservation(save_path)
+        editor_new = SamsungSEFEditor(save_path)
         new_repr = get_state(editor_new)
 
         # 4. Compare
@@ -77,7 +77,7 @@ def test_modification(filepath):
     save_path = os.path.join(OUTPUT_DIR, f"mod_{filename}")
 
     try:
-        editor = SamsungSEFEditorPreservation(filepath)
+        editor = SamsungSEFEditor(filepath)
 
         # MODIFY: Update or Add UTC Timestamp
         editor.add_or_update_entry("Image_UTC_Data", TEST_TIMESTAMP)
@@ -85,7 +85,7 @@ def test_modification(filepath):
         editor.save(save_path)
 
         # VERIFY
-        checker = SamsungSEFEditorPreservation(save_path)
+        checker = SamsungSEFEditor(save_path)
 
         found_val = None
         for e in checker.entries:
@@ -109,7 +109,7 @@ def test_preservation_logic(filepath):
     """Test 4: Verify that we are actually detecting encapsulation styles."""
     filename = os.path.basename(filepath)
     try:
-        editor = SamsungSEFEditorPreservation(filepath)
+        editor = SamsungSEFEditor(filepath)
 
         # Check specifically for Camera Mode (0xc61) or Timestamp (0xa01)
         # We want to see if it detected ENCAP_DIRECT (1) vs ENCAP_NULL (2)
