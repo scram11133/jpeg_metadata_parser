@@ -1,6 +1,7 @@
-import struct
 import os
 import re
+import struct
+
 from loguru import logger
 
 
@@ -33,6 +34,27 @@ class SamsungSEFEditor:
     }
 
     DEFAULT_EMBEDDED_IDS = [0x001, 0xb41, 0xc81, 0xd11, 0xd31, 0xa01, 0xba1, 0x910, 0xc61]
+
+    # IDs that MUST exist only once (Global Metadata)
+    # If duplicates are found here, the file is likely corrupt/illegal.
+    SINGLETON_IDS = [
+        0xa01,  # Image_UTC_Data (Timestamp)
+        0xaa1,  # MCC_Data (Location/Country)
+        0xc61,  # Camera_Capture_Mode_Info
+        0xa30,  # MotionPhoto_Data (Video)
+        0xa41,  # BackupRestore_Data
+        0xd11,  # Video_Snapshot_Info
+    ]
+
+    # IDs that CAN exist multiple times (Assets/Layers)
+    # It is valid for these to appear 2+ times with different data.
+    CONTAINER_IDS = [
+        0x001,  # Generic_SubImage (ID 1) -> Thumbnails, DualShot Images
+        0xb41,  # Generic_DepthMap -> Portrait Mode Depth & Confidence
+        0xab1,  # DualShot_DepthMap_1 (ID 2737) -> Multiple depth layers
+        0xba1,  # PhotoEditor_Data (Edit History)
+        0xb30,  # Camera_Sticker_Info -> AR Stickers
+    ]
 
     def __init__(self, filepath):
         self.filepath = filepath
@@ -119,15 +141,19 @@ class SamsungSEFEditor:
             else:
                 padding_bytes = data[entry['end']: next_start]
 
-            # Analysis (Now returns head_padding too)
+            # Analysis
             name, clean_val, encap_style, head_pad = self._analyze_payload(entry['entry_id'], raw_payload)
+
+            # --- DEBUG LOGGING ---
+            # logger.debug(f"Loaded: {name} ({hex(entry['entry_id'])}) | Encap: {encap_style}")
 
             self.entries.append({
                 'entry_id': entry['entry_id'],
+                'hex_id': hex(entry['entry_id']),  # <--- ADDED HEX ID FOR INVESTIGATION
                 'name': name,
                 'value': clean_val,
-                'padding': padding_bytes,  # Tail Padding (Gap)
-                'head_padding': head_pad,  # Head Padding (Garbage before name)
+                'padding': padding_bytes,
+                'head_padding': head_pad,
                 'encap_type': encap_style,
                 'is_modified': False
             })
@@ -152,17 +178,14 @@ class SamsungSEFEditor:
         try:
             head_str = payload[:100].decode('latin-1')
             if expected_name in head_str:
-                # Remove ^ anchor to find name even if there is junk before it
                 match = re.search(re.escape(expected_name), head_str)
                 if match:
                     val_start = match.end()
                     name_start = match.start()
 
-                    # Capture Head Padding (Garbage before name)
                     if name_start > 0:
                         head_padding = payload[:name_start]
 
-                    # Determine Style
                     if val_start < len(payload) and payload[val_start] == 0:
                         return expected_name, payload[val_start + 1:], self.ENCAP_NULL, head_padding
                     else:
@@ -213,7 +236,6 @@ class SamsungSEFEditor:
                 entry['name'] = name
                 entry['is_modified'] = True
 
-                # Upgrade mis-detected Raw types
                 if final_id in self.DEFAULT_EMBEDDED_IDS:
                     if entry['encap_type'] == self.ENCAP_RAW:
                         if final_id in [0xa01, 0xc61]:
@@ -221,7 +243,7 @@ class SamsungSEFEditor:
                         else:
                             entry['encap_type'] = self.ENCAP_NULL
 
-                logger.info(f"Updated {hex(final_id)}")
+                logger.info(f"Updated {name} ({hex(final_id)})")  # <--- IMPROVED LOGGING
                 return
 
         # Add New
@@ -233,10 +255,16 @@ class SamsungSEFEditor:
                 def_encap = self.ENCAP_NULL
 
         self.entries.append({
-            'entry_id': final_id, 'name': name, 'value': binary_payload,
-            'padding': b'', 'head_padding': b'', 'encap_type': def_encap, 'is_modified': True
+            'entry_id': final_id,
+            'hex_id': hex(final_id),  # <--- ADDED HEX ID
+            'name': name,
+            'value': binary_payload,
+            'padding': b'',
+            'head_padding': b'',
+            'encap_type': def_encap,
+            'is_modified': True
         })
-        logger.info(f"Added {hex(final_id)}")
+        logger.info(f"Added {name} ({hex(final_id)})")  # <--- IMPROVED LOGGING
 
     def _resolve_id(self, key):
         if isinstance(key, int): return key
@@ -254,17 +282,40 @@ class SamsungSEFEditor:
     # --- SAVE ---
 
     def _validate_integrity(self):
-        seen = set()
+        """
+        Enforces forensic rules:
+        1. Block duplicate Singletons (e.g. 2 Timestamps is illegal).
+        2. Allow duplicate Containers (e.g. 2 Sub-Images is valid).
+        3. Warn on unknown duplicates.
+        """
+        id_counts = {}
+
+        # 1. Count occurrences
         for e in self.entries:
-            if e['entry_id'] in seen:
-                logger.critical(f"INTEGRITY FAIL: Duplicate ID {hex(e['entry_id'])}")
-                return False
-            seen.add(e['entry_id'])
-        return True
+            tid = e['entry_id']
+            id_counts[tid] = id_counts.get(tid, 0) + 1
+
+        # 2. Validate Rules
+        is_valid = True
+
+        for tid, count in id_counts.items():
+            # RULE A: Strict Singleton Check
+            if tid in self.SINGLETON_IDS and count > 1:
+                name = self.SEF_TAG_MAP.get(tid, "Unknown")
+                logger.critical(f"INTEGRITY FAIL: Found {count} copies of Singleton Tag {hex(tid)} ({name}). File is corrupt.")
+                is_valid = False
+
+            # RULE B: Unknown Duplicates (Warning only)
+            elif count > 1 and tid not in self.CONTAINER_IDS:
+                # If it's not a known Singleton OR a known Container, it's suspicious.
+                name = self.SEF_TAG_MAP.get(tid, "Unknown")
+                logger.warning(f"Warning: Unknown tag {hex(tid)} ({name}) appears {count} times. This might be unsafe.")
+
+        return is_valid
 
     def save(self, output_path):
         if not self._validate_integrity(): return
-        logger.info(f"Rebuilding PRESERVED SEF trailer for {output_path}...")
+        logger.info(f"Rebuilding SEF trailer for {output_path}...")
 
         packed_blocks = []
 
@@ -272,26 +323,21 @@ class SamsungSEFEditor:
             val = e['value']
             name = e['name']
             encap = e['encap_type']
-            head_pad = e.get('head_padding', b'')  # Restore head garbage
+            head_pad = e.get('head_padding', b'')
 
             # Reconstruct Payload
-            # Start with Head Padding (The garbage before the name)
             final_payload = head_pad
 
-            # Append Encapsulated Data
             if encap == self.ENCAP_DIRECT:
-                # Only add name if val doesn't already have it
-                if not val.startswith(name.encode('utf-8')):
-                    final_payload += name.encode('utf-8') + val
-                else:
-                    final_payload += val
+                # FIX: Always prepend Name. Never assume it's already there.
+                # Previous logic (if not val.startswith...) caused data loss
+                # when Value == Name.
+                final_payload += name.encode('utf-8') + val
 
             elif encap == self.ENCAP_NULL:
+                # FIX: Always prepend Name + Null.
                 name_bytes = name.encode('utf-8') + b'\x00'
-                if not val.startswith(name_bytes):
-                    final_payload += name_bytes + val
-                else:
-                    final_payload += val
+                final_payload += name_bytes + val
 
             elif encap == self.ENCAP_RAW:
                 final_payload += val
@@ -301,7 +347,6 @@ class SamsungSEFEditor:
             if not e['is_modified']:
                 final_padding = e['padding']
             else:
-                # Recalculate strict alignment for dirty items
                 real_len = len(final_payload)
                 remainder = real_len % 4
                 if remainder != 0:
