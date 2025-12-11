@@ -4,7 +4,7 @@ import re
 from loguru import logger
 
 
-class SamsungSEFEditorPreservation:
+class SamsungSEFEditor:
     SEFT_MAGIC = b'SEFT'
     SEFH_MAGIC = b'SEFH'
 
