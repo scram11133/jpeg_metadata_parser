@@ -129,7 +129,7 @@ class SamsungSEFEditorPreservation:
                 'padding': padding_bytes,  # Tail Padding (Gap)
                 'head_padding': head_pad,  # Head Padding (Garbage before name)
                 'encap_type': encap_style,
-                'is_dirty': False
+                'is_modified': False
             })
 
         # JPEG Isolation
@@ -211,7 +211,7 @@ class SamsungSEFEditorPreservation:
             if entry['entry_id'] == final_id:
                 entry['value'] = binary_payload
                 entry['name'] = name
-                entry['is_dirty'] = True
+                entry['is_modified'] = True
 
                 # Upgrade mis-detected Raw types
                 if final_id in self.DEFAULT_EMBEDDED_IDS:
@@ -234,7 +234,7 @@ class SamsungSEFEditorPreservation:
 
         self.entries.append({
             'entry_id': final_id, 'name': name, 'value': binary_payload,
-            'padding': b'', 'head_padding': b'', 'encap_type': def_encap, 'is_dirty': True
+            'padding': b'', 'head_padding': b'', 'encap_type': def_encap, 'is_modified': True
         })
         logger.info(f"Added {hex(final_id)}")
 
@@ -298,7 +298,7 @@ class SamsungSEFEditorPreservation:
 
             # Handle Tail Padding
             final_padding = b''
-            if not e['is_dirty']:
+            if not e['is_modified']:
                 final_padding = e['padding']
             else:
                 # Recalculate strict alignment for dirty items
