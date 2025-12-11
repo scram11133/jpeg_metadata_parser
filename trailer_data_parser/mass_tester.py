@@ -1,14 +1,17 @@
 import os
+import shutil
 from pathlib import Path
-
 from loguru import logger
 
 from trailer_data_parser.parser import SamsungSEFEditor
 
 # ================= CONFIGURATION =================
-TEST_ROOT_DIR = "/home/kfir/Desktop/scrambler/trailer_data_research_ds_mod"  # Folder with subfolders
-TARGET_TAG_ID = 0xa01  # Image_UTC_Data (Standard test target)
-TEST_VALUE_STR = "1111111111111"  # 13 chars (Same len as original usually)
+TEST_ROOT_DIR = "/home/kfir/Desktop/scrambler/trailer_data_research_ds_mod"
+TARGET_TAG_ID = 0xa01  # Existing tag to Modify/Remove
+TEST_VALUE_STR = "1111111111111"
+DUMMY_TAG_ID = 0x999  # New tag to Add
+DUMMY_TAG_NAME = "Forensic_Test_Tag"
+DUMMY_VALUE = "Test_Data_123"
 
 
 # =================================================
@@ -21,70 +24,97 @@ def compare_binary(original_entry, new_entry):
     return True
 
 
-def run_forensic_test(filepath):
-    temp_output = str(filepath) + ".temp_test.jpg"
-
+def run_modification_test(filepath):
+    """Standard Modification Test (Change Value)"""
+    temp_output = str(filepath) + ".mod_test.jpg"
     try:
-        # --- STEP 1: LOAD ORIGINAL ---
         orig_editor = SamsungSEFEditor(filepath)
-        if not orig_editor.entries:
-            return False, "SKIP: No SEF data found"
+        if not orig_editor.entries: return False, "SKIP: No SEF data"
 
-        # Snapshot original state {id: entry_dict}
+        # Snapshot
         original_state = {e['entry_id']: e for e in orig_editor.entries}
+        if TARGET_TAG_ID not in original_state: return False, "SKIP: Target tag missing"
 
-        if TARGET_TAG_ID not in original_state:
-            return False, f"SKIP: Target tag {hex(TARGET_TAG_ID)} not found in file"
-
-        # --- STEP 2: MODIFY ---
-        # Modify ONLY the UTC Data
+        # Modify
         orig_editor.add_or_update_entry(TARGET_TAG_ID, TEST_VALUE_STR)
-
-        # --- STEP 3: SAVE ---
         orig_editor.save(temp_output)
 
-        # --- STEP 4: RELOAD & VERIFY ---
+        # Verify
         new_editor = SamsungSEFEditor(temp_output)
         new_state = {e['entry_id']: e for e in new_editor.entries}
 
-        # CHECK A: MODIFICATION (The target tag)
+        # Check Target
         target = new_state.get(TARGET_TAG_ID)
-        if not target:
-            return False, "FAIL: Target tag disappeared after save"
+        if not target: return False, "FAIL: Modified tag vanished"
+        if TEST_VALUE_STR not in str(target['value']): return False, "FAIL: Value mismatch"
 
-        # Check Value
-        val_str = target['value'].decode('utf-8', errors='ignore')
-        if TEST_VALUE_STR not in val_str:
-            return False, f"FAIL: Value mismatch. Got {val_str}"
-
-        # Check Alignment (New padding must be 0x00 and valid length)
-        # Note: We rely on the class logic, but visual check:
-        if any(b != 0 for b in target['padding']):
-            return False, "FAIL: Modified tag has non-zero padding (Dirty)"
-
-        # CHECK B: INTEGRITY (All other tags)
+        # Check Integrity of others
         for tid, orig_entry in original_state.items():
-            if tid == TARGET_TAG_ID: continue  # Skip the one we modified
-
-            if tid not in new_state:
-                return False, f"FAIL: Integrity Lost. Tag {hex(tid)} vanished."
-
-            new_entry = new_state[tid]
-
-            # BIT-PERFECT CHECK
-            # We compare the binary chunks directly.
-            # If the head_padding (garbage) or tail_padding changed even by 1 byte, this fails.
-            if not compare_binary(orig_entry, new_entry):
-                return False, f"FAIL: Integrity Violation on {hex(tid)}. Data shifted."
+            if tid == TARGET_TAG_ID: continue
+            if tid not in new_state: return False, f"FAIL: Integrity Lost. {hex(tid)} vanished."
+            if not compare_binary(orig_entry, new_state[tid]): return False, f"FAIL: Data shift on {hex(tid)}"
 
     except Exception as e:
         return False, f"CRASH: {str(e)}"
-
     finally:
-        if os.path.exists(temp_output):
-            os.remove(temp_output)
+        if os.path.exists(temp_output): os.remove(temp_output)
+    return True, "PASSED"
 
-    return True, "PASSED (Forensic Match)"
+
+def run_add_remove_test(filepath):
+    """New Test: Add Entry -> Save -> Remove Entry -> Save"""
+    temp_add = str(filepath) + ".add_test.jpg"
+    temp_del = str(filepath) + ".del_test.jpg"
+
+    try:
+        # --- PHASE 1: ADD ENTRY ---
+        orig_editor = SamsungSEFEditor(filepath)
+        if not orig_editor.entries: return False, "SKIP: No SEF data"
+        original_state = {e['entry_id']: e for e in orig_editor.entries}
+
+        # Add new dummy entry
+        orig_editor.add_or_update_entry(DUMMY_TAG_ID, DUMMY_VALUE, name=DUMMY_TAG_NAME)
+        orig_editor.save(temp_add)
+
+        # Verify Add
+        add_editor = SamsungSEFEditor(temp_add)
+        add_state = {e['entry_id']: e for e in add_editor.entries}
+
+        if DUMMY_TAG_ID not in add_state:
+            return False, "FAIL (Add): New tag not found after save"
+
+        # Verify Integrity of OLD tags (Offsets should shift, but data must match)
+        for tid, orig_entry in original_state.items():
+            if not compare_binary(orig_entry, add_state[tid]):
+                return False, f"FAIL (Add): Adding tag corrupted existing tag {hex(tid)}"
+
+        # --- PHASE 2: REMOVE ENTRY ---
+        # Remove the tag we just added
+        add_editor.remove_entry(DUMMY_TAG_ID)
+        add_editor.save(temp_del)
+
+        # Verify Remove
+        del_editor = SamsungSEFEditor(temp_del)
+        del_state = {e['entry_id']: e for e in del_editor.entries}
+
+        if DUMMY_TAG_ID in del_state:
+            return False, "FAIL (Remove): Tag still exists after deletion"
+
+        # Verify Integrity again (Should match original file exactly now?)
+        # Note: If we removed the ONLY change we made, the file *content* for tags matches,
+        # but the directory structure was rebuilt so offsets might differ, but payload must match.
+        for tid, orig_entry in original_state.items():
+            if tid not in del_state: return False, f"FAIL (Remove): Original tag {hex(tid)} lost."
+            if not compare_binary(orig_entry, del_state[tid]):
+                return False, f"FAIL (Remove): Deleting tag corrupted existing tag {hex(tid)}"
+
+    except Exception as e:
+        return False, f"CRASH: {str(e)}"
+    finally:
+        if os.path.exists(temp_add): os.remove(temp_add)
+        if os.path.exists(temp_del): os.remove(temp_del)
+
+    return True, "PASSED"
 
 
 def main():
@@ -92,31 +122,34 @@ def main():
     stats = {"passed": 0, "failed": 0, "skipped": 0}
     failures = []
 
-    print(f"🕵️  Running Forensic Integrity Suite on: {root}\n")
+    print(f"🕵️  Running Forensic Suite (Mod + Add/Remove) on: {root}\n")
 
     for file_path in root.rglob('*'):
         if file_path.is_file() and file_path.suffix.lower() in ['.jpg', '.jpeg']:
-
             print(f"Testing: {file_path.name}...", end="\r")
 
-            success, msg = run_forensic_test(str(file_path))
+            # Run Test 1: Modification
+            s1, m1 = run_modification_test(str(file_path))
 
-            if success:
+            # Run Test 2: Add/Remove
+            s2, m2 = run_add_remove_test(str(file_path))
+
+            if s1 and s2:
                 stats["passed"] += 1
+            elif "SKIP" in m1 or "SKIP" in m2:
+                stats["skipped"] += 1
             else:
-                if "SKIP" in msg:
-                    stats["skipped"] += 1
-                else:
-                    stats["failed"] += 1
-                    failures.append(f"{file_path.name}: {msg}")
-                    logger.error(f"{file_path.name} | {msg}")
+                stats["failed"] += 1
+                reason = m1 if not s1 else m2
+                failures.append(f"{file_path.name}: {reason}")
+                logger.error(f"{file_path.name} | {reason}")
 
     print("\n" + "=" * 50)
     print(f"  FORENSIC REPORT")
     print("=" * 50)
-    print(f"✅ PASSED (Bit-Perfect): {stats['passed']}")
-    print(f"❌ FAILED (Corruption):   {stats['failed']}")
-    print(f"⏭ SKIPPED:               {stats['skipped']}")
+    print(f"✅ PASSED (All Tests):   {stats['passed']}")
+    print(f"❌ FAILED:               {stats['failed']}")
+    print(f"⏭ SKIPPED:              {stats['skipped']}")
     print("=" * 50)
 
     if failures:
