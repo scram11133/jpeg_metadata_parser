@@ -29,11 +29,15 @@ def run_modification_test(filepath):
     temp_output = str(filepath) + ".mod_test.jpg"
     try:
         orig_editor = SamsungSEFEditor(filepath)
-        if not orig_editor.entries: return False, "SKIP: No SEF data"
+        if not orig_editor.entries:
+            print(f"SKIP: No SEF data in {filepath}")
+            return False, "SKIP: No SEF data in {filepath}"
 
         # Snapshot
         original_state = {e['entry_id']: e for e in orig_editor.entries}
-        if TARGET_TAG_ID not in original_state: return False, "SKIP: Target tag missing"
+        if TARGET_TAG_ID not in original_state:
+            print(f"SKIP: Target tag missing in {filepath}")
+            return False, "SKIP: Target tag missing"
 
         # Modify
         orig_editor.add_or_update_entry(TARGET_TAG_ID, TEST_VALUE_STR)
